@@ -88,7 +88,14 @@ impl Lac {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn from_dir(model_dir: impl AsRef<Path>) -> Result<Self, LacError> {
         Ok(Self {
-            runtime: ModelRuntime::from_directory(model_dir.as_ref())?,
+            runtime: ModelRuntime::from_directory(model_dir.as_ref(), None)?,
+        })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn from_dir_with_mode(model_dir: impl AsRef<Path>, mode: Mode) -> Result<Self, LacError> {
+        Ok(Self {
+            runtime: ModelRuntime::from_directory(model_dir.as_ref(), Some(mode))?,
         })
     }
 
@@ -156,7 +163,7 @@ struct ModelRuntime {
 
 impl ModelRuntime {
     #[cfg(not(target_arch = "wasm32"))]
-    fn from_directory(model_dir: &Path) -> Result<Self, LacError> {
+    fn from_directory(model_dir: &Path, mode_hint: Option<Mode>) -> Result<Self, LacError> {
         let conf_dir = model_dir.join("conf");
         let param_dir = model_dir.join("model");
         let args_ini = read_file(conf_dir.join("args.ini"))?;
@@ -164,9 +171,14 @@ impl ModelRuntime {
         let q2b_dic = read_file(conf_dir.join("q2b.dic"))?;
         let tag_dic = read_file(conf_dir.join("tag.dic"))?;
 
-        Self::from_sources(None, &args_ini, &word_dic, &q2b_dic, &tag_dic, |name| {
-            read_file(param_dir.join(name))
-        })
+        Self::from_sources(
+            mode_hint,
+            &args_ini,
+            &word_dic,
+            &q2b_dic,
+            &tag_dic,
+            |name| read_file(param_dir.join(name)),
+        )
     }
 
     #[cfg(feature = "bundled-models")]
@@ -199,11 +211,6 @@ impl ModelRuntime {
         F: FnMut(&str) -> Result<Vec<u8>, LacError>,
     {
         let parsed_args = parse_ini(args_ini)?;
-        let mode =
-            mode_hint.unwrap_or_else(|| match parsed_args.get("tag_type").map(String::as_str) {
-                Some("seg") => Mode::Seg,
-                _ => Mode::Lac,
-            });
         let word_emb_dim = parse_ini_usize(&parsed_args, "word_emb_dim")?;
         let grnn_hidden_dim = parse_ini_usize(&parsed_args, "grnn_hidden_dim")?;
         let bigru_num = parse_ini_usize(&parsed_args, "bigru_num")?;
@@ -220,6 +227,7 @@ impl ModelRuntime {
         if label_map.is_empty() {
             return Err(LacError::Parse("tag dictionary is empty".to_string()));
         }
+        let mode = mode_hint.unwrap_or_else(|| infer_mode(&parsed_args, &label_map));
 
         let vocab_size = word2id.values().copied().max().unwrap_or(0) as usize + 1;
         let num_labels = label_map.keys().copied().max().unwrap_or(0) as usize + 1;
@@ -507,6 +515,37 @@ fn parse_ini_usize(values: &HashMap<String, String>, key: &str) -> Result<usize,
         .map_err(|error| LacError::Parse(format!("invalid `{key}` in args.ini: {error}")))
 }
 
+fn parse_mode_value(raw: &str) -> Option<Mode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "lac" | "tag" | "lexer" => Some(Mode::Lac),
+        "seg" | "cutter" => Some(Mode::Seg),
+        _ => None,
+    }
+}
+
+fn infer_mode(parsed_args: &HashMap<String, String>, label_map: &HashMap<i64, String>) -> Mode {
+    if let Some(mode) = parsed_args
+        .get("model")
+        .and_then(|value| parse_mode_value(value))
+    {
+        return mode;
+    }
+    if let Some(mode) = parsed_args
+        .get("tag_type")
+        .and_then(|value| parse_mode_value(value))
+    {
+        return mode;
+    }
+
+    let is_seg_label = |label: &str| matches!(label, "-B" | "-I" | "-E" | "-S");
+    let has_only_seg_labels = label_map.values().all(|label| is_seg_label(label.as_str()));
+    if has_only_seg_labels {
+        Mode::Seg
+    } else {
+        Mode::Lac
+    }
+}
+
 fn load_word2id(input: &[u8]) -> Result<HashMap<String, i64>, LacError> {
     let content = std::str::from_utf8(input)
         .map_err(|error| LacError::Parse(format!("`word.dic` is not utf8: {error}")))?;
@@ -765,7 +804,9 @@ fn read_file(path: impl AsRef<Path>) -> Result<Vec<u8>, LacError> {
 
 #[cfg(all(test, feature = "bundled-models"))]
 mod tests {
-    use super::{Lac, Mode, OutputItem};
+    use super::{infer_mode, Lac, Mode, OutputItem};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
 
     #[test]
     fn lac_mode_matches_reference_example() {
@@ -803,5 +844,52 @@ mod tests {
         let seg = Lac::new(Mode::Seg).expect("load bundled seg model");
         let words = seg.cut("百度是一家高科技公司");
         assert_eq!(words, vec!["百度", "是", "一家", "高科技", "公司"]);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn model_dir(path: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn from_dir_infers_mode_from_model_key() {
+        let lac = Lac::from_dir(model_dir("models_general/lac_model")).expect("load lac model");
+        assert_eq!(lac.mode(), Mode::Lac);
+
+        let seg = Lac::from_dir(model_dir("models_general/seg_model")).expect("load seg model");
+        assert_eq!(seg.mode(), Mode::Seg);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn from_dir_with_mode_overrides_detected_mode() {
+        let forced = Lac::from_dir_with_mode(model_dir("models_general/seg_model"), Mode::Lac)
+            .expect("load seg model with forced mode");
+        assert_eq!(forced.mode(), Mode::Lac);
+    }
+
+    #[test]
+    fn infer_mode_fallbacks_work() {
+        let mut labels = HashMap::new();
+        labels.insert(0, "n-B".to_string());
+        labels.insert(1, "n-I".to_string());
+        labels.insert(2, "O".to_string());
+
+        let mut args = HashMap::new();
+        args.insert("model".to_string(), "seg".to_string());
+        args.insert("tag_type".to_string(), "tag".to_string());
+        assert_eq!(infer_mode(&args, &labels), Mode::Seg);
+
+        args.remove("model");
+        assert_eq!(infer_mode(&args, &labels), Mode::Lac);
+
+        let mut seg_labels = HashMap::new();
+        seg_labels.insert(0, "-B".to_string());
+        seg_labels.insert(1, "-I".to_string());
+        seg_labels.insert(2, "-E".to_string());
+        seg_labels.insert(3, "-S".to_string());
+        args.remove("tag_type");
+        assert_eq!(infer_mode(&args, &seg_labels), Mode::Seg);
     }
 }
