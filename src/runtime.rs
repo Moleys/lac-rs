@@ -21,6 +21,32 @@ pub struct OutputItem {
     pub tag: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainOptions {
+    pub epochs: usize,
+    pub learning_rate: f32,
+    pub max_samples: Option<usize>,
+}
+
+impl Default for TrainOptions {
+    fn default() -> Self {
+        Self {
+            epochs: 3,
+            learning_rate: 0.05,
+            max_samples: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainReport {
+    pub epochs: usize,
+    pub samples: usize,
+    pub tokens: usize,
+    pub token_accuracy: f32,
+    pub average_log_likelihood: f32,
+}
+
 #[derive(Debug)]
 pub enum LacError {
     Parse(String),
@@ -117,6 +143,20 @@ impl Lac {
     pub fn cut(&self, query: &str) -> Vec<String> {
         self.run(query).into_iter().map(|item| item.word).collect()
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn train_from_tsv(
+        &mut self,
+        train_data: impl AsRef<Path>,
+        options: TrainOptions,
+    ) -> Result<TrainReport, LacError> {
+        self.runtime.train_from_tsv(train_data.as_ref(), &options)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn evaluate_tsv(&self, eval_data: impl AsRef<Path>) -> Result<TrainReport, LacError> {
+        self.runtime.evaluate_tsv(eval_data.as_ref())
+    }
 }
 
 #[derive(Debug)]
@@ -154,11 +194,20 @@ struct ModelRuntime {
     word2id: HashMap<String, i64>,
     q2b: HashMap<String, String>,
     id2label: Vec<String>,
+    #[cfg(not(target_arch = "wasm32"))]
+    label2id: HashMap<String, usize>,
     oov_id: i64,
     config: ModelConfig,
     vocab_size: usize,
     num_labels: usize,
     params: ModelParams,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone)]
+struct TrainingSample {
+    token_ids: Vec<usize>,
+    gold_tag_ids: Vec<usize>,
 }
 
 impl ModelRuntime {
@@ -221,6 +270,8 @@ impl ModelRuntime {
         let word2id = load_word2id(word_dic)?;
         let q2b = load_q2b(q2b_dic)?;
         let label_map = load_id2label(tag_dic)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let label2id = load_label2id(tag_dic)?;
         if word2id.is_empty() {
             return Err(LacError::Parse("word dictionary is empty".to_string()));
         }
@@ -347,6 +398,8 @@ impl ModelRuntime {
             word2id,
             q2b,
             id2label,
+            #[cfg(not(target_arch = "wasm32"))]
+            label2id,
             oov_id,
             config,
             vocab_size,
@@ -361,27 +414,53 @@ impl ModelRuntime {
             return Vec::new();
         }
 
-        let mut token_ids = Vec::with_capacity(seq_words.len());
-        for word in &seq_words {
-            let normalized = self
-                .q2b
-                .get(word)
-                .map(String::as_str)
-                .unwrap_or(word.as_str());
-            let token_id =
-                self.word2id
-                    .get(normalized)
-                    .copied()
-                    .unwrap_or(self.oov_id)
-                    .clamp(0, (self.vocab_size.saturating_sub(1)) as i64) as usize;
-            token_ids.push(token_id);
-        }
-
+        let token_ids: Vec<usize> = seq_words
+            .iter()
+            .map(|word| self.token_id_for_word(word))
+            .collect();
         let tag_ids = self.predict_tags(&token_ids);
         self.parse_targets(&seq_words, &tag_ids)
     }
 
-    fn predict_tags(&self, token_ids: &[usize]) -> Vec<usize> {
+    fn token_id_for_word(&self, word: &str) -> usize {
+        let normalized = self.q2b.get(word).map(String::as_str).unwrap_or(word);
+        self.word2id
+            .get(normalized)
+            .copied()
+            .unwrap_or(self.oov_id)
+            .clamp(0, (self.vocab_size.saturating_sub(1)) as i64) as usize
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn clamp_label_id(&self, id: usize) -> usize {
+        if self.num_labels == 0 {
+            0
+        } else {
+            id.min(self.num_labels - 1)
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn fallback_label_id(&self) -> usize {
+        if let Some(id) = self.label2id.get("O").copied() {
+            return self.clamp_label_id(id);
+        }
+        if let Some(id) = self.label2id.get("-S").copied() {
+            return self.clamp_label_id(id);
+        }
+        0
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn label_id_or_fallback(&self, label: &str, fallback: usize) -> usize {
+        self.label2id
+            .get(label)
+            .copied()
+            .map(|id| self.clamp_label_id(id))
+            .unwrap_or(fallback)
+    }
+
+    fn compute_emission(&self, token_ids: &[usize]) -> Vec<f32> {
         if token_ids.is_empty() {
             return Vec::new();
         }
@@ -448,16 +527,294 @@ impl ModelRuntime {
             features = merged;
         }
 
-        let emission = matmul_add_bias(
+        matmul_add_bias(
             &features,
             steps,
             hidden * 2,
             self.num_labels,
             &self.params.emission_w,
             &self.params.emission_b,
-        );
+        )
+    }
 
-        viterbi_decode(&emission, steps, self.num_labels, &self.params.crf_w)
+    fn predict_tags(&self, token_ids: &[usize]) -> Vec<usize> {
+        if token_ids.is_empty() {
+            return Vec::new();
+        }
+        let emission = self.compute_emission(token_ids);
+        viterbi_decode(
+            &emission,
+            token_ids.len(),
+            self.num_labels,
+            &self.params.crf_w,
+        )
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn train_from_tsv(
+        &mut self,
+        train_path: &Path,
+        options: &TrainOptions,
+    ) -> Result<TrainReport, LacError> {
+        if options.epochs == 0 {
+            return Err(LacError::Parse("`epochs` must be > 0".to_string()));
+        }
+        if options.learning_rate <= 0.0 {
+            return Err(LacError::Parse("`learning_rate` must be > 0".to_string()));
+        }
+
+        let samples = self.load_training_samples(train_path, options.max_samples)?;
+        if samples.is_empty() {
+            return Err(LacError::Parse(format!(
+                "no usable training samples in `{}`",
+                train_path.display()
+            )));
+        }
+
+        let mut gradient = vec![0f32; self.params.crf_w.len()];
+        let mut total_tokens = 0usize;
+        let mut total_correct = 0usize;
+        let mut total_log_likelihood = 0f32;
+        let mut total_samples = 0usize;
+
+        for _ in 0..options.epochs {
+            for sample in &samples {
+                if sample.token_ids.is_empty() || sample.gold_tag_ids.is_empty() {
+                    continue;
+                }
+                let emission = self.compute_emission(&sample.token_ids);
+                let predicted = viterbi_decode(
+                    &emission,
+                    sample.token_ids.len(),
+                    self.num_labels,
+                    &self.params.crf_w,
+                );
+                total_correct += predicted
+                    .iter()
+                    .zip(sample.gold_tag_ids.iter())
+                    .filter(|(predicted_tag, gold_tag)| predicted_tag == gold_tag)
+                    .count();
+                total_tokens += sample.gold_tag_ids.len();
+                total_log_likelihood += crf_log_likelihood_and_gradient(
+                    &emission,
+                    &sample.gold_tag_ids,
+                    self.num_labels,
+                    &self.params.crf_w,
+                    &mut gradient,
+                );
+                for (weight, grad) in self.params.crf_w.iter_mut().zip(gradient.iter().copied()) {
+                    *weight += options.learning_rate * grad;
+                }
+                total_samples += 1;
+            }
+        }
+
+        if total_samples == 0 {
+            return Err(LacError::Parse(format!(
+                "no usable training samples in `{}`",
+                train_path.display()
+            )));
+        }
+
+        Ok(TrainReport {
+            epochs: options.epochs,
+            samples: total_samples,
+            tokens: total_tokens,
+            token_accuracy: if total_tokens == 0 {
+                0.0
+            } else {
+                total_correct as f32 / total_tokens as f32
+            },
+            average_log_likelihood: total_log_likelihood / total_samples as f32,
+        })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn evaluate_tsv(&self, eval_path: &Path) -> Result<TrainReport, LacError> {
+        let samples = self.load_training_samples(eval_path, None)?;
+        if samples.is_empty() {
+            return Err(LacError::Parse(format!(
+                "no usable evaluation samples in `{}`",
+                eval_path.display()
+            )));
+        }
+
+        let mut total_tokens = 0usize;
+        let mut total_correct = 0usize;
+        let mut total_log_likelihood = 0f32;
+
+        for sample in &samples {
+            let emission = self.compute_emission(&sample.token_ids);
+            let predicted = viterbi_decode(
+                &emission,
+                sample.token_ids.len(),
+                self.num_labels,
+                &self.params.crf_w,
+            );
+            total_correct += predicted
+                .iter()
+                .zip(sample.gold_tag_ids.iter())
+                .filter(|(predicted_tag, gold_tag)| predicted_tag == gold_tag)
+                .count();
+            total_tokens += sample.gold_tag_ids.len();
+            total_log_likelihood += crf_log_likelihood(
+                &emission,
+                &sample.gold_tag_ids,
+                self.num_labels,
+                &self.params.crf_w,
+            );
+        }
+
+        Ok(TrainReport {
+            epochs: 1,
+            samples: samples.len(),
+            tokens: total_tokens,
+            token_accuracy: if total_tokens == 0 {
+                0.0
+            } else {
+                total_correct as f32 / total_tokens as f32
+            },
+            average_log_likelihood: total_log_likelihood / samples.len() as f32,
+        })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn load_training_samples(
+        &self,
+        data_path: &Path,
+        max_samples: Option<usize>,
+    ) -> Result<Vec<TrainingSample>, LacError> {
+        let bytes = read_file(data_path)?;
+        let content = std::str::from_utf8(&bytes).map_err(|error| {
+            LacError::Parse(format!("`{}` is not utf8: {error}", data_path.display()))
+        })?;
+
+        let limit = max_samples.unwrap_or(usize::MAX);
+        let mut samples = Vec::new();
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some(sample) = self.parse_training_line(line) else {
+                continue;
+            };
+            samples.push(sample);
+            if samples.len() >= limit {
+                break;
+            }
+        }
+
+        Ok(samples)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn parse_training_line(&self, line: &str) -> Option<TrainingSample> {
+        match self.mode {
+            Mode::Lac => self.parse_lac_training_line(line),
+            Mode::Seg => self.parse_seg_training_line(line),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn parse_lac_training_line(&self, line: &str) -> Option<TrainingSample> {
+        let fallback = self.fallback_label_id();
+        let mut token_ids = Vec::new();
+        let mut gold_tag_ids = Vec::new();
+
+        for item in line.split_whitespace() {
+            let (word, tag) = item.rsplit_once('/')?;
+            if word.is_empty() || tag.is_empty() {
+                return None;
+            }
+
+            let begin_tag = format!("{tag}-B");
+            let inside_tag = format!("{tag}-I");
+            let begin_id = self.label_id_or_fallback(&begin_tag, fallback);
+            let inside_id = self.label_id_or_fallback(&inside_tag, begin_id);
+
+            for (index, ch) in word.chars().enumerate() {
+                let ch_text = ch.to_string();
+                token_ids.push(self.token_id_for_word(&ch_text));
+                if index == 0 {
+                    gold_tag_ids.push(begin_id);
+                } else {
+                    gold_tag_ids.push(inside_id);
+                }
+            }
+        }
+
+        if token_ids.is_empty() || token_ids.len() != gold_tag_ids.len() {
+            return None;
+        }
+
+        Some(TrainingSample {
+            token_ids,
+            gold_tag_ids,
+        })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn parse_seg_training_line(&self, line: &str) -> Option<TrainingSample> {
+        let fallback = self.fallback_label_id();
+        let begin_id = self.label_id_or_fallback("-B", fallback);
+        let inside_id = self.label_id_or_fallback("-I", begin_id);
+        let end_id = self.label_id_or_fallback("-E", inside_id);
+        let single_id = self.label_id_or_fallback("-S", end_id);
+
+        let mut token_ids = Vec::new();
+        let mut gold_tag_ids = Vec::new();
+
+        for item in line.split_whitespace() {
+            let word = item.rsplit_once('/').map(|(word, _)| word).unwrap_or(item);
+            if word.is_empty() {
+                continue;
+            }
+
+            let chars: Vec<char> = word.chars().collect();
+            if chars.is_empty() {
+                continue;
+            }
+
+            match chars.len() {
+                1 => {
+                    let ch_text = chars[0].to_string();
+                    token_ids.push(self.token_id_for_word(&ch_text));
+                    gold_tag_ids.push(single_id);
+                }
+                2 => {
+                    let first = chars[0].to_string();
+                    let second = chars[1].to_string();
+                    token_ids.push(self.token_id_for_word(&first));
+                    gold_tag_ids.push(begin_id);
+                    token_ids.push(self.token_id_for_word(&second));
+                    gold_tag_ids.push(end_id);
+                }
+                _ => {
+                    let last_index = chars.len() - 1;
+                    for (index, ch) in chars.into_iter().enumerate() {
+                        let ch_text = ch.to_string();
+                        token_ids.push(self.token_id_for_word(&ch_text));
+                        if index == 0 {
+                            gold_tag_ids.push(begin_id);
+                        } else if index == last_index {
+                            gold_tag_ids.push(end_id);
+                        } else {
+                            gold_tag_ids.push(inside_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        if token_ids.is_empty() || token_ids.len() != gold_tag_ids.len() {
+            return None;
+        }
+
+        Some(TrainingSample {
+            token_ids,
+            gold_tag_ids,
+        })
     }
 
     fn parse_targets(&self, words: &[String], tag_ids: &[usize]) -> Vec<OutputItem> {
@@ -590,6 +947,24 @@ fn load_id2label(input: &[u8]) -> Result<HashMap<i64, String>, LacError> {
             .parse::<i64>()
             .map_err(|error| LacError::Parse(format!("invalid tag id `{id}`: {error}")))?;
         output.insert(id, tag.to_string());
+    }
+    Ok(output)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_label2id(input: &[u8]) -> Result<HashMap<String, usize>, LacError> {
+    let content = std::str::from_utf8(input)
+        .map_err(|error| LacError::Parse(format!("`tag.dic` is not utf8: {error}")))?;
+    let mut output = HashMap::new();
+    for raw_line in content.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        let Some((id, tag)) = line.split_once('\t') else {
+            continue;
+        };
+        let id = id
+            .parse::<usize>()
+            .map_err(|error| LacError::Parse(format!("invalid tag id `{id}`: {error}")))?;
+        output.insert(tag.to_string(), id);
     }
     Ok(output)
 }
@@ -791,6 +1166,165 @@ fn viterbi_decode(
         path[step - 1] = backpointers[step * num_labels + current];
     }
     path
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn log_sum_exp(values: &[f32]) -> f32 {
+    let mut max_value = f32::NEG_INFINITY;
+    for value in values {
+        if *value > max_value {
+            max_value = *value;
+        }
+    }
+    if !max_value.is_finite() {
+        return max_value;
+    }
+    let mut sum = 0f32;
+    for value in values {
+        sum += (*value - max_value).exp();
+    }
+    max_value + sum.ln()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn crf_sequence_score(emission: &[f32], gold: &[usize], num_labels: usize, crf_w: &[f32]) -> f32 {
+    if gold.is_empty() {
+        return 0.0;
+    }
+
+    let mut score = crf_w[gold[0]] + emission[gold[0]];
+    for step in 1..gold.len() {
+        let previous = gold[step - 1];
+        let current = gold[step];
+        score += crf_w[(previous + 2) * num_labels + current];
+        score += emission[step * num_labels + current];
+    }
+    score + crf_w[num_labels + gold[gold.len() - 1]]
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn crf_forward(
+    emission: &[f32],
+    timesteps: usize,
+    num_labels: usize,
+    crf_w: &[f32],
+) -> (Vec<f32>, f32) {
+    let mut alpha = vec![f32::NEG_INFINITY; timesteps * num_labels];
+    for label in 0..num_labels {
+        alpha[label] = crf_w[label] + emission[label];
+    }
+
+    let mut score_buffer = vec![0f32; num_labels];
+    for step in 1..timesteps {
+        let previous_offset = (step - 1) * num_labels;
+        let current_offset = step * num_labels;
+        for current_label in 0..num_labels {
+            for previous_label in 0..num_labels {
+                score_buffer[previous_label] = alpha[previous_offset + previous_label]
+                    + crf_w[(previous_label + 2) * num_labels + current_label];
+            }
+            alpha[current_offset + current_label] =
+                emission[current_offset + current_label] + log_sum_exp(&score_buffer);
+        }
+    }
+
+    let last_offset = (timesteps - 1) * num_labels;
+    for label in 0..num_labels {
+        score_buffer[label] = alpha[last_offset + label] + crf_w[num_labels + label];
+    }
+    let log_z = log_sum_exp(&score_buffer);
+    (alpha, log_z)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn crf_backward(emission: &[f32], timesteps: usize, num_labels: usize, crf_w: &[f32]) -> Vec<f32> {
+    let mut beta = vec![f32::NEG_INFINITY; timesteps * num_labels];
+    let last_offset = (timesteps - 1) * num_labels;
+    for label in 0..num_labels {
+        beta[last_offset + label] = crf_w[num_labels + label];
+    }
+
+    let mut score_buffer = vec![0f32; num_labels];
+    for step in (0..timesteps - 1).rev() {
+        let current_offset = step * num_labels;
+        let next_offset = (step + 1) * num_labels;
+        for current_label in 0..num_labels {
+            for next_label in 0..num_labels {
+                score_buffer[next_label] = crf_w[(current_label + 2) * num_labels + next_label]
+                    + emission[next_offset + next_label]
+                    + beta[next_offset + next_label];
+            }
+            beta[current_offset + current_label] = log_sum_exp(&score_buffer);
+        }
+    }
+
+    beta
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn crf_log_likelihood(emission: &[f32], gold: &[usize], num_labels: usize, crf_w: &[f32]) -> f32 {
+    if gold.is_empty() {
+        return 0.0;
+    }
+    let (_, log_z) = crf_forward(emission, gold.len(), num_labels, crf_w);
+    crf_sequence_score(emission, gold, num_labels, crf_w) - log_z
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn crf_log_likelihood_and_gradient(
+    emission: &[f32],
+    gold: &[usize],
+    num_labels: usize,
+    crf_w: &[f32],
+    gradient: &mut [f32],
+) -> f32 {
+    gradient.fill(0.0);
+    if gold.is_empty() {
+        return 0.0;
+    }
+
+    let timesteps = gold.len();
+    let (alpha, log_z) = crf_forward(emission, timesteps, num_labels, crf_w);
+    let beta = crf_backward(emission, timesteps, num_labels, crf_w);
+    let log_likelihood = crf_sequence_score(emission, gold, num_labels, crf_w) - log_z;
+
+    gradient[gold[0]] += 1.0;
+    gradient[num_labels + gold[timesteps - 1]] += 1.0;
+    for step in 1..timesteps {
+        let previous = gold[step - 1];
+        let current = gold[step];
+        gradient[(previous + 2) * num_labels + current] += 1.0;
+    }
+
+    for label in 0..num_labels {
+        let log_probability = alpha[label] + beta[label] - log_z;
+        gradient[label] -= log_probability.exp();
+    }
+
+    let last_offset = (timesteps - 1) * num_labels;
+    for label in 0..num_labels {
+        let log_probability = alpha[last_offset + label] + beta[last_offset + label] - log_z;
+        gradient[num_labels + label] -= log_probability.exp();
+    }
+
+    for step in 1..timesteps {
+        let previous_offset = (step - 1) * num_labels;
+        let current_offset = step * num_labels;
+        for previous_label in 0..num_labels {
+            let previous_alpha = alpha[previous_offset + previous_label];
+            for current_label in 0..num_labels {
+                let log_probability = previous_alpha
+                    + crf_w[(previous_label + 2) * num_labels + current_label]
+                    + emission[current_offset + current_label]
+                    + beta[current_offset + current_label]
+                    - log_z;
+                gradient[(previous_label + 2) * num_labels + current_label] -=
+                    log_probability.exp();
+            }
+        }
+    }
+
+    log_likelihood
 }
 
 #[cfg(not(target_arch = "wasm32"))]

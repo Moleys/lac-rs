@@ -26,6 +26,25 @@ let result = lac.run("百度是一家高科技公司");
 cargo build
 ```
 
+## Train with `data/` dataset (native Rust)
+
+Training runs native in Rust and fine-tunes only `crfw` (CRF transition weights), while keeping BiGRU emissions frozen.
+
+```bash
+cargo run --example train
+```
+
+Default paths:
+- model: `models_general/lac_model`
+- train: `data/lac_train_chivi.tsv`
+- eval: `data/lac_test_chivi.tsv`
+
+Custom paths/params:
+
+```bash
+cargo run --example train -- <model_dir> <train_tsv> <eval_tsv> <epochs> <learning_rate> [max_samples]
+```
+
 ## Build wasm (model embedded)
 
 ```bash
