@@ -1,0 +1,18 @@
+[package]
+name = "lac-rs"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = ["bundled-models"]
+bundled-models = []
+wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
