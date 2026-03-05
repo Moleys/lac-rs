@@ -26,6 +26,35 @@ let result = lac.run("百度是一家高科技公司");
 cargo build
 ```
 
+## Build Linux standalone package
+
+```bash
+bash scripts/build-standalone-linux.sh
+```
+
+Sau khi build xong:
+- binary: `standalone/bin/lac-rs-train`
+- model: `standalone/models_general/lac_model`
+- data: `standalone/data/*.tsv`
+- CUDA trainer: `standalone/gpu_crf_trainer.py`
+- setup env script: `standalone/setup-gpu-env.sh`
+- sequence train script: `standalone/train-sequence-gpu.sh` (texsmart 10 → zh_gsdsimp 20 → chivi 20)
+- file upload VPS: `lac-rs-standalone-linux-<arch>.tar.gz`
+
+Deploy nhanh lên VPS:
+```bash
+scp lac-rs-standalone-linux-<arch>.tar.gz user@vps:/path/
+ssh user@vps
+tar -xzf lac-rs-standalone-linux-<arch>.tar.gz
+cd standalone
+# VastAI image: vastai/pytorch_cuda-12.6.3-auto/jupyter
+GPU_COUNT=2 GPU_MODEL="RTX 4070" bash train-sequence-gpu.sh
+
+# Nếu thiếu torch/cuda trong python env thì setup fallback:
+bash setup-gpu-env.sh
+GPU_COUNT=2 GPU_MODEL="RTX 4070" bash train-sequence-gpu.sh
+```
+
 ## Train with `data/` dataset (native Rust)
 
 Training runs native in Rust and fine-tunes only `crfw` (CRF transition weights), while keeping BiGRU emissions frozen.

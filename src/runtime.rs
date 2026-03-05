@@ -571,14 +571,32 @@ impl ModelRuntime {
             )));
         }
 
+        let samples_per_epoch = samples.len();
+        let tokens_per_epoch: usize = samples.iter().map(|sample| sample.gold_tag_ids.len()).sum();
+        let progress_interval = (samples_per_epoch / 20).max(1);
+        eprintln!(
+            "[train] start mode={:?} epochs={} lr={} samples/epoch={} tokens/epoch={} file={}",
+            self.mode,
+            options.epochs,
+            options.learning_rate,
+            samples_per_epoch,
+            tokens_per_epoch,
+            train_path.display()
+        );
+
         let mut gradient = vec![0f32; self.params.crf_w.len()];
         let mut total_tokens = 0usize;
         let mut total_correct = 0usize;
         let mut total_log_likelihood = 0f32;
         let mut total_samples = 0usize;
 
-        for _ in 0..options.epochs {
-            for sample in &samples {
+        for epoch_index in 0..options.epochs {
+            let mut epoch_tokens = 0usize;
+            let mut epoch_correct = 0usize;
+            let mut epoch_log_likelihood = 0f32;
+            let mut epoch_samples = 0usize;
+
+            for (sample_index, sample) in samples.iter().enumerate() {
                 if sample.token_ids.is_empty() || sample.gold_tag_ids.is_empty() {
                     continue;
                 }
@@ -595,17 +613,53 @@ impl ModelRuntime {
                     .filter(|(predicted_tag, gold_tag)| predicted_tag == gold_tag)
                     .count();
                 total_tokens += sample.gold_tag_ids.len();
-                total_log_likelihood += crf_log_likelihood_and_gradient(
+                epoch_correct += predicted
+                    .iter()
+                    .zip(sample.gold_tag_ids.iter())
+                    .filter(|(predicted_tag, gold_tag)| predicted_tag == gold_tag)
+                    .count();
+                epoch_tokens += sample.gold_tag_ids.len();
+
+                let sample_log_likelihood = crf_log_likelihood_and_gradient(
                     &emission,
                     &sample.gold_tag_ids,
                     self.num_labels,
                     &self.params.crf_w,
                     &mut gradient,
                 );
+                total_log_likelihood += sample_log_likelihood;
+                epoch_log_likelihood += sample_log_likelihood;
+                epoch_samples += 1;
                 for (weight, grad) in self.params.crf_w.iter_mut().zip(gradient.iter().copied()) {
                     *weight += options.learning_rate * grad;
                 }
                 total_samples += 1;
+
+                let is_checkpoint = (sample_index + 1) % progress_interval == 0
+                    || sample_index + 1 == samples_per_epoch;
+                if is_checkpoint {
+                    let progress = ((sample_index + 1) as f32 / samples_per_epoch as f32) * 100.0;
+                    let accuracy = if epoch_tokens == 0 {
+                        0.0
+                    } else {
+                        epoch_correct as f32 / epoch_tokens as f32
+                    };
+                    let average_ll = if epoch_samples == 0 {
+                        0.0
+                    } else {
+                        epoch_log_likelihood / epoch_samples as f32
+                    };
+                    eprintln!(
+                        "[train] epoch {}/{} progress {:>5.1}% ({}/{}) acc={:.4} avg_ll={:.4}",
+                        epoch_index + 1,
+                        options.epochs,
+                        progress,
+                        sample_index + 1,
+                        samples_per_epoch,
+                        accuracy,
+                        average_ll
+                    );
+                }
             }
         }
 
@@ -638,6 +692,13 @@ impl ModelRuntime {
                 eval_path.display()
             )));
         }
+
+        eprintln!(
+            "[eval] start mode={:?} samples={} file={}",
+            self.mode,
+            samples.len(),
+            eval_path.display()
+        );
 
         let mut total_tokens = 0usize;
         let mut total_correct = 0usize;
